@@ -1,12 +1,32 @@
-import os, subprocess, tkinter as tk, sys, shutil, concurrent.futures, threading, psutil
+import os
+import subprocess
+import tkinter as tk
+import sys
+import shutil
+import concurrent.futures
+import threading
+import psutil
 from tkinter import ttk, messagebox, filedialog
 from functools import partial
+import time
+import re
 
-try:
-    import send2trash
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "send2trash"])
-    import send2trash
+def import_send2trash():
+    try:
+        import send2trash
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "send2trash"])
+        import send2trash
+    return send2trash
+
+send2trash = import_send2trash()
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class MacVacuum:
     def __init__(self, root):
@@ -21,6 +41,15 @@ class MacVacuum:
         self.scan_results, self.scanning = [], False
         self.progress_var = tk.DoubleVar()
         self.setup_tabs()
+        self.last_scan_time = None
+        self.duplicate_files = {}
+        self.file_categories = {
+            'Documents': ['.pdf', '.doc', '.docx', '.txt', '.rtf'],
+            'Images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp'],
+            'Videos': ['.mp4', '.avi', '.mov', '.wmv', '.flv'],
+            'Audio': ['.mp3', '.wav', '.aac', '.flac', '.ogg'],
+            'Archives': ['.zip', '.rar', '.7z', '.tar', '.gz']
+        }
 
     def configure_styles(self):
         self.style.configure("TButton", padding=5, font=("Helvetica", 10))
@@ -32,7 +61,8 @@ class MacVacuum:
 
     def setup_tabs(self):
         tabs = [("Scan", self.setup_scan_tab), ("System", self.setup_system_tab),
-                ("Disk", self.setup_disk_usage_tab), ("Help", self.setup_help_tab)]
+                ("Disk", self.setup_disk_usage_tab), ("Help", self.setup_help_tab),
+                ("Duplicates", self.setup_duplicates_tab), ("Categories", self.setup_categories_tab)]
         for name, setup in tabs:
             tab = ttk.Frame(self.notebook)
             self.notebook.add(tab, text=name)
@@ -44,33 +74,33 @@ class MacVacuum:
         ttk.Button(tab, text="Custom Scan", command=self.start_custom_scan).pack(pady=5)
         self.progress_bar = ttk.Progressbar(tab, variable=self.progress_var, length=300)
         self.progress_bar.pack(pady=10)
-        self.result_tree = ttk.Treeview(tab, columns=("Type", "Path", "Size"), show="headings", selectmode="extended")
-        for col in ("Type", "Path", "Size"):
+        self.result_tree = ttk.Treeview(tab, columns=("Type", "Path", "Size", "Last Modified"), show="headings", selectmode="extended")
+        for col in ("Type", "Path", "Size", "Last Modified"):
             self.result_tree.heading(col, text=col, command=lambda c=col: self.treeview_sort_column(c, False))
             self.result_tree.column(col, width=100)
         self.result_tree.column("Path", width=300)
         self.result_tree.pack(fill=tk.BOTH, expand=True)
         ttk.Button(tab, text="Clean Selected", command=self.clean_selected).pack(pady=5)
         ttk.Button(tab, text="Stop Scan", command=self.stop_scan).pack(pady=5)
+        ttk.Button(tab, text="Schedule Scan", command=self.schedule_scan).pack(pady=5)
 
-    def setup_system_tab(self, tab):
-        self.system_info_text = tk.Text(tab, wrap=tk.WORD, font=("Helvetica", 10), bg="#f03324")
-        self.system_info_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.update_system_info()
+    def setup_duplicates_tab(self, tab):
+        self.duplicates_tree = ttk.Treeview(tab, columns=("File", "Size", "Duplicates"), show="headings", selectmode="extended")
+        for col in ("File", "Size", "Duplicates"):
+            self.duplicates_tree.heading(col, text=col, command=lambda c=col: self.treeview_sort_column(c, False))
+            self.duplicates_tree.column(col, width=100)
+        self.duplicates_tree.column("File", width=300)
+        self.duplicates_tree.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(tab, text="Find Duplicates", command=self.find_duplicates).pack(pady=5)
+        ttk.Button(tab, text="Remove Selected Duplicates", command=self.remove_selected_duplicates).pack(pady=5)
 
-    def setup_disk_usage_tab(self, tab):
-        self.disk_usage_frame = ttk.Frame(tab)
-        self.disk_usage_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.update_disk_usage()
-
-    def setup_help_tab(self, tab):
-        help_text = "MacVacuum - Disk Space Optimizer\n\nQuick Scan: Common locations\nDeep Scan: Entire system\nCustom Scan: Select directories\nClean Selected: Remove items\nStop Scan: Halt process\n\nWarning: Use carefully"
-        ttk.Label(tab, text=help_text, wraplength=500, justify="left").pack(padx=20, pady=20)
-
-    def start_custom_scan(self):
-        directory = filedialog.askdirectory()
-        if directory:
-            self.start_scan([directory])
+    def setup_categories_tab(self, tab):
+        self.categories_tree = ttk.Treeview(tab, columns=("Category", "Count", "Total Size"), show="headings", selectmode="extended")
+        for col in ("Category", "Count", "Total Size"):
+            self.categories_tree.heading(col, text=col, command=lambda c=col: self.treeview_sort_column(c, False))
+            self.categories_tree.column(col, width=100)
+        self.categories_tree.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(tab, text="Analyze Categories", command=self.analyze_categories).pack(pady=5)
 
     def start_scan(self, locations):
         if self.scanning:
@@ -91,6 +121,7 @@ class MacVacuum:
                 self.scan_results.extend(future.result())
                 self.progress_var.set((i / len(futures)) * 100)
         self.scanning = False
+        self.last_scan_time = time.time()
         self.root.after(0, self.update_result_tree)
 
     def scan_directory(self, directory):
@@ -103,9 +134,11 @@ class MacVacuum:
                     break
                 file_path = os.path.join(root, file)
                 try:
-                    file_size = os.path.getsize(file_path)
+                    file_stat = os.stat(file_path)
+                    file_size = file_stat.st_size
+                    last_modified = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_stat.st_mtime))
                     if file_size > 600 * 1024 * 1024 or file == '.DS_Store':
-                        results.append((("DS_Store" if file == '.DS_Store' else "Large File"), file_path, self.format_size(file_size)))
+                        results.append(("DS_Store" if file == '.DS_Store' else "Large File", file_path, self.format_size(file_size), last_modified))
                 except OSError:
                     continue
         return results
@@ -133,37 +166,100 @@ class MacVacuum:
                 return f"{size:.2f} {unit}"
             size /= 1024.0
 
-    def update_system_info(self):
-        self.system_info_text.delete(1.0, tk.END)
-        self.system_info_text.insert(tk.END, subprocess.check_output(["system_profiler", "SPHardwareDataType"]).decode())
-        cpu_usage, memory = psutil.cpu_percent(interval=1), psutil.virtual_memory()
-        self.system_info_text.insert(tk.END, f"\nCPU: {cpu_usage}%\nMemory: {self.format_size(memory.used)} / {self.format_size(memory.total)} ({memory.percent}%)\n")
-        self.root.after(5000, self.update_system_info)
+    def schedule_scan(self):
+        interval = simpledialog.askinteger("Schedule Scan", "Enter scan interval in hours:", minvalue=1, maxvalue=168)
+        if interval:
+            threading.Thread(target=self.scheduled_scan_thread, args=(interval,), daemon=True).start()
 
-    def update_disk_usage(self):
-        for widget in self.disk_usage_frame.winfo_children():
-            widget.destroy()
-        for partition in psutil.disk_partitions():
-            try:
-                usage = psutil.disk_usage(partition.mountpoint)
-                ttk.Label(self.disk_usage_frame, text=f"{partition.device} ({partition.mountpoint}):").pack(anchor="w", pady=(10, 5))
-                ttk.Progressbar(self.disk_usage_frame, length=300, value=usage.percent).pack(anchor="w")
-                ttk.Label(self.disk_usage_frame, text=f"Used: {self.format_size(usage.used)} / {self.format_size(usage.total)} ({usage.percent}%)").pack(anchor="w", pady=(5, 10))
-            except PermissionError:
-                continue
-        self.root.after(60000, self.update_disk_usage)
+    def scheduled_scan_thread(self, interval):
+        while True:
+            time.sleep(interval * 3600)
+            self.start_scan([os.path.expanduser("~")])
 
-    def stop_scan(self):
-        self.scanning = False
+    def find_duplicates(self):
+        self.duplicate_files.clear()
+        self.duplicates_tree.delete(*self.duplicates_tree.get_children())
+        for item in self.scan_results:
+            file_path = item[1]
+            file_size = os.path.getsize(file_path)
+            file_hash = self.get_file_hash(file_path)
+            if file_hash in self.duplicate_files:
+                self.duplicate_files[file_hash].append(file_path)
+            else:
+                self.duplicate_files[file_hash] = [file_path]
+        
+        for file_hash, file_list in self.duplicate_files.items():
+            if len(file_list) > 1:
+                self.duplicates_tree.insert("", "end", values=(file_list[0], self.format_size(os.path.getsize(file_list[0])), len(file_list)))
+
+    def get_file_hash(self, file_path):
+        import hashlib
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            buf = f.read(65536)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = f.read(65536)
+        return hasher.hexdigest()
+
+    def remove_selected_duplicates(self):
+        selected_items = self.duplicates_tree.selection()
+        if not selected_items:
+            messagebox.showinfo("No Selection", "Please select duplicate items to remove.")
+            return
+        if messagebox.askyesno("Confirm Deletion", "Delete selected duplicate items?"):
+            for item in selected_items:
+                file_path = self.duplicates_tree.item(item)['values'][0]
+                file_hash = self.get_file_hash(file_path)
+                duplicate_list = self.duplicate_files[file_hash]
+                for dup_file in duplicate_list[1:]:
+                    try:
+                        send2trash.send2trash(dup_file)
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to delete {dup_file}: {str(e)}")
+                self.duplicates_tree.delete(item)
+
+    def analyze_categories(self):
+        self.categories_tree.delete(*self.categories_tree.get_children())
+        category_stats = {category: {'count': 0, 'size': 0} for category in self.file_categories}
+        
+        for item in self.scan_results:
+            file_path = item[1]
+            file_size = os.path.getsize(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            for category, extensions in self.file_categories.items():
+                if file_ext in extensions:
+                    category_stats[category]['count'] += 1
+                    category_stats[category]['size'] += file_size
+                    break
+            else:
+                if 'Other' not in category_stats:
+                    category_stats['Other'] = {'count': 0, 'size': 0}
+                category_stats['Other']['count'] += 1
+                category_stats['Other']['size'] += file_size
+        
+        for category, stats in category_stats.items():
+            self.categories_tree.insert("", "end", values=(category, stats['count'], self.format_size(stats['size'])))
 
     def treeview_sort_column(self, col, reverse):
         l = [(self.result_tree.set(k, col), k) for k in self.result_tree.get_children('')]
-        l.sort(reverse=reverse)
+        l.sort(key=lambda t: self.natural_keys(t[0]), reverse=reverse)
         for index, (_, k) in enumerate(l):
             self.result_tree.move(k, '', index)
         self.result_tree.heading(col, command=lambda: self.treeview_sort_column(col, not reverse))
 
+    def natural_keys(self, text):
+        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
+
 if __name__ == "__main__":
+    if getattr(sys, 'frozen', False):
+        application_path = sys._MEIPASS
+    else:
+        application_path = os.path.dirname(os.path.abspath(__file__))
+
+    os.chdir(application_path)
+
     root = tk.Tk()
     app = MacVacuum(root)
     root.mainloop()
